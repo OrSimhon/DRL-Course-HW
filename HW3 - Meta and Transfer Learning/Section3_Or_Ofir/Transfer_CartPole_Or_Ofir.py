@@ -1,0 +1,269 @@
+######################### Or Simhon 315600486, Ofir Ben Moshe 315923151 #########################
+# Actor Critic: Acrobot and MountainCar to Cart Pole
+import numpy as np
+import gym
+import tensorflow.compat.v1 as tf
+from tensorboardX import SummaryWriter
+import time
+
+tf.disable_v2_behavior()
+
+
+class ActorNet:
+    def __init__(self, state_size, action_size, MountainCarVars, AcrobotVars, name='ActorNetwork'):
+        self.state_size = state_size
+        self.action_size = action_size
+
+        with tf.variable_scope(name):
+            self.learning_rate = tf.placeholder(dtype=tf.float32, name='learning_rate')
+            self.state = tf.placeholder(tf.float32, [None, self.state_size], name='state')
+            self.action = tf.placeholder(tf.int32, [self.action_size], name='action')
+            self.delta = tf.placeholder(tf.float32, name='delta')
+            self.I = tf.placeholder(tf.float32, name='I')
+
+            self.W1_Acrobot = AcrobotVars[0]
+            self.b1_Acrobot = AcrobotVars[1]
+            self.W2_Acrobot = AcrobotVars[2]
+            self.b2_Acrobot = AcrobotVars[3]
+            self.W1_MountainCar = MountainCarVars[0]
+            self.b1_MountainCar = MountainCarVars[1]
+            self.W2_MountainCar = MountainCarVars[2]
+            self.b2_MountainCar = MountainCarVars[3]
+            self.W3_MountainCar = MountainCarVars[4]
+            self.b3_MountainCar = MountainCarVars[5]
+
+            self.W1 = tf.get_variable('W1', [self.state_size, 64],
+                                      initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.b1 = tf.get_variable("b1", [64], initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.W2 = tf.get_variable("W3", [64, self.action_size],
+                                      initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.b2 = tf.get_variable("b3", [self.action_size], initializer=tf.zeros_initializer())
+
+            self.U2_MountainCar = tf.get_variable("U2_MountainCar", [self.action_size, self.action_size],
+                                                  initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.U2_Acrobot = tf.get_variable("U2_Acrobot", [self.action_size, self.action_size],
+                                              initializer=tf.keras.initializers.glorot_normal(seed=0))
+
+            self.A1_MountainCar = tf.nn.relu(tf.add(tf.matmul(self.state, self.W1_MountainCar), self.b1_MountainCar))
+            self.A2_MountainCar = tf.nn.relu(
+                tf.add(tf.matmul(self.A1_MountainCar, self.W2_MountainCar), self.b2_MountainCar))
+            self.A3_MountainCar = tf.nn.relu(
+                tf.add(tf.matmul(self.A2_MountainCar, self.W3_MountainCar), self.b3_MountainCar))
+
+            self.A1_Acrobot = tf.nn.relu(tf.add(tf.matmul(self.state, self.W1_Acrobot), self.b1_Acrobot))
+            self.A2_Acrobot = tf.nn.relu(tf.add(tf.matmul(self.A1_Acrobot, self.W2_Acrobot), self.b2_Acrobot))
+
+            self.A1 = tf.nn.relu(tf.add(tf.matmul(self.state, self.W1), self.b1))
+            self.Z2 = tf.add(tf.matmul(self.A1, self.W2), self.b2)
+            self.Z2 = tf.add(self.Z2, tf.matmul(self.A2_Acrobot, self.U2_Acrobot))
+            self.output = tf.add(self.Z2, tf.matmul(self.A3_MountainCar, self.U2_MountainCar))
+
+            # Actions probabilities: Pr(A|S=s)
+            self.actions_distribution = tf.squeeze(tf.nn.softmax(self.output))
+            # log of the taken action a: ln[Pr(A=a|S=s)]
+            self.neg_log_prob = tf.nn.softmax_cross_entropy_with_logits_v2(logits=self.output, labels=self.action)
+            # actor_loss = -ln[Pr(A=a|S=s)] * I * delta
+            self.loss = tf.reduce_mean(self.neg_log_prob * self.delta * self.I)
+            self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
+
+    def sample_action(self, sess, observation, env_action_dim):
+        actions_distribution = sess.run(self.actions_distribution,
+                                        {self.state: observation})[:env_action_dim]
+
+        actions_distribution = np.ones(env_action_dim) / env_action_dim if sum(actions_distribution == 0) else [
+            x * (1 / (float(sum(actions_distribution)))) for x in actions_distribution]
+        action = np.random.choice(np.arange(env_action_dim), p=actions_distribution)
+
+        return action
+
+
+class CriticNet:
+    def __init__(self, state_size, name='CriticNetwork'):
+        self.state_size = state_size
+
+        with tf.variable_scope(name):
+            self.learning_rate = tf.placeholder(dtype=tf.float32, name="learning_rate")
+            self.state = tf.placeholder(tf.float32, [None, self.state_size], name='state')
+            self.target = tf.placeholder(tf.float32, name="Gt")
+            self.I = tf.placeholder(tf.float32, name='I')
+
+            self.W1 = tf.get_variable('W1', [self.state_size, 64],
+                                      initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.b1 = tf.get_variable("b1", [64], initializer=tf.zeros_initializer())
+            self.W2 = tf.get_variable("W2", [64, 1],
+                                      initializer=tf.keras.initializers.glorot_normal(seed=0))
+            self.b2 = tf.get_variable("b2", [1], initializer=tf.zeros_initializer())
+
+            self.Z1 = tf.add(tf.matmul(self.state, self.W1), self.b1)
+            self.A1 = tf.nn.relu(self.Z1)
+            self.value = tf.squeeze(tf.add(tf.matmul(self.A1, self.W2), self.b2))
+
+            # critic_loss = ((target - v) * I) ** 2
+            self.loss = tf.reduce_mean(tf.square((self.target - self.value) * self.I))
+            self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
+
+
+class ActorCritic_Agent:
+    def __init__(self, env, sess, hp, writer, saved_model_path):
+        self.env = env
+        self.general_observation_dim = 6
+        self.general_action_dim = 3
+        self.env_observation_dim = self.env.observation_space.shape[0]
+        self.env_action_dim = self.env.action_space.n
+        self.writer = writer
+        self.gamma = hp['gamma']
+        self.actor_lr = hp['actor_lr']
+        self.critic_lr = hp['critic_lr']
+        self.max_episodes = hp['max_episodes']
+        self.sess = sess
+        MountainCarVars = self.load_model_variables(saved_model_path, MountainCar=True)
+        AcrobotVars = self.load_model_variables(saved_model_path)
+
+        self.actor_net = ActorNet(state_size=self.general_observation_dim, action_size=self.general_action_dim,
+                                  MountainCarVars=MountainCarVars,
+                                  AcrobotVars=AcrobotVars)
+        self.critic_net = CriticNet(state_size=self.general_observation_dim)
+
+    def load_model_variables(self, saved_model_path, MountainCar=False):
+        graph = tf.get_default_graph()
+        if MountainCar:
+            with graph.as_default():
+                saver = tf.train.import_meta_graph(saved_model_path + '\MountainCar\MountainCarModel.meta')
+                saver.restore(self.sess, tf.train.latest_checkpoint(saved_model_path + '\MountainCar'))
+
+                W1 = tf.constant(graph.get_tensor_by_name('ActorNetwork/W1:0').eval())
+                b1 = tf.constant(graph.get_tensor_by_name('ActorNetwork/b1:0').eval())
+                W2 = tf.constant(graph.get_tensor_by_name('ActorNetwork/W2:0').eval())
+                b2 = tf.constant(graph.get_tensor_by_name('ActorNetwork/b2:0').eval())
+                W3 = tf.constant(graph.get_tensor_by_name('ActorNetwork/W3:0').eval())
+                b3 = tf.constant(graph.get_tensor_by_name('ActorNetwork/b3:0').eval())
+                return [W1, b1, W2, b2, W3, b3]
+        else:
+            with graph.as_default():
+                saver = tf.train.import_meta_graph(saved_model_path + "\Acrobot\AcrobotModel.meta")
+                saver.restore(self.sess, tf.train.latest_checkpoint(saved_model_path + "\Acrobot"))
+
+                W1 = tf.constant(graph.get_tensor_by_name('ActorNetwork/W1:0').eval())
+                b1 = tf.constant(graph.get_tensor_by_name('ActorNetwork/b1:0').eval())
+                W2 = tf.constant(graph.get_tensor_by_name('ActorNetwork/W2:0').eval())
+                b2 = tf.constant(graph.get_tensor_by_name('ActorNetwork/b2:0').eval())
+                return [W1, b1, W2, b2]
+
+    def update_networks(self, state, action_one_hot, next_state, reward, done, I):
+
+        # Predict the value of the current state and next state
+        v = self.sess.run(self.critic_net.value, {self.critic_net.state: state})  # V(s) from Critic NN
+        v_next = self.sess.run(self.critic_net.value, {self.critic_net.state: next_state})  # V(s') from Critic NN
+
+        target = np.atleast_1d(reward + self.gamma * v_next * (1 - int(done)))  # Gt = r + gamma * v(s')
+        delta = target - v
+
+        # Update the critic
+        feed_dict_val = {self.critic_net.state: state, self.critic_net.target: target, self.critic_net.I: I,
+                         self.critic_net.learning_rate: self.critic_lr}
+        _, val_loss = self.sess.run([self.critic_net.optimizer, self.critic_net.loss], feed_dict_val)
+
+        # Update the actor
+        feed_dict = {self.actor_net.state: state, self.actor_net.delta: delta, self.actor_net.I: I,
+                     self.actor_net.action: action_one_hot,
+                     self.actor_net.learning_rate: self.actor_lr}
+        _, actor_loss = self.sess.run([self.actor_net.optimizer, self.actor_net.loss], feed_dict)
+
+        return actor_loss
+
+    def test_agent(self, visualize='True'):
+
+        s = np.pad(self.env.reset(), (0, self.general_observation_dim - self.env_observation_dim), 'constant')
+        total_reward = 0.0
+        finish = False
+
+        while not finish:
+            if visualize:
+                self.env.render()
+            a = self.actor_net.sample_action(self.sess, np.atleast_2d(s), self.env_action_dim)
+            s, r, finish, _ = self.env.step(a)
+            s = np.pad(s, (0, self.general_observation_dim - self.env_observation_dim), 'constant')
+            total_reward += r
+        print("Total reward in the test: %.2f" % total_reward)
+        self.env.close()
+
+    def train(self):
+
+        start_time = time.time()
+        self.sess.run(tf.global_variables_initializer())
+        max_score = 475.0
+        episode_loss = []
+        average_score = []
+        total_steps = 0
+
+        for episode in range(self.max_episodes):
+            state = np.pad(self.env.reset(), (0, self.general_observation_dim - self.env_observation_dim), 'constant')
+            done = False
+            episode_score = 0
+            I = 1  # Discount Factor
+
+            # Learning rates decay
+            if episode % 60 == 0 and episode > 0:
+                self.actor_lr *= 0.7
+                self.critic_lr *= 0.7
+
+            while not done:
+                total_steps += 1
+                action = self.actor_net.sample_action(self.sess, np.atleast_2d(state), self.env_action_dim)
+                next_state, reward, done, _ = self.env.step(action)
+                next_state = np.pad(next_state, (0, self.general_observation_dim - self.env_observation_dim),
+                                    'constant')
+                action_one_hot = np.zeros(self.general_action_dim)
+                action_one_hot[action] = 1
+                episode_score += reward
+
+                actor_loss = self.update_networks(np.atleast_2d(state), action_one_hot,
+                                                  np.atleast_2d(next_state), reward, done, I)
+
+                self.writer.add_scalar('Actor Loss per step', actor_loss, total_steps)
+                episode_loss.append(actor_loss)
+                state = next_state
+                I *= self.gamma
+            average_score.append(episode_score)
+            print(
+                "Episode {} | Reward: {:04.2f} | Average over 100 episodes: {:04.2f}".format(episode + 1,
+                                                                                             episode_score,
+                                                                                             np.mean(
+                                                                                                 average_score[
+                                                                                                 -100:])))
+            self.writer.add_scalar('Total reward per episode', episode_score, episode)
+            self.writer.add_scalar('Mean reward in the last 100 episodes', np.mean(average_score[-100:]), episode)
+
+            if np.mean(average_score[-100:]) >= max_score:
+                print(
+                    "\nGreat!! "
+                    "You win after: {} Episodes\n"
+                    "Average reward in the last 100 episodes: {}".format(episode + 1,
+                                                                         np.mean(average_score[-100:])))
+                saver = tf.train.Saver()
+                saver.save(self.sess, 'SavedModels/AcrobotToCartPoleModel')
+                break
+
+        training_time = (time.time() - start_time) / 60
+        print("Training complete after {:.2} minutes".format(training_time))
+        self.writer.close()
+        self.test_agent()
+
+
+if __name__ == '__main__':
+    env = gym.make("CartPole-v1")
+
+    # This HP win after 431 Episodes
+    best_hyper_parameters = {
+        'critic_lr': 0.01,
+        'actor_lr': 0.001,
+        'gamma': 0.99,
+        'max_episodes': 1300
+    }
+    writer = SummaryWriter()
+    tf.reset_default_graph()
+    saved_model_path = 'G:\My Drive\Python Projects\TensorFlowProjects\DRL Course - Gilad\Or and Ofir\HW3\section1_Or_Ofir\SavedModels'
+    with tf.Session() as sess:
+        model = ActorCritic_Agent(env=env, sess=sess, hp=best_hyper_parameters, writer=writer,
+                                  saved_model_path=saved_model_path)
+        model.train()
